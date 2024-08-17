@@ -1,8 +1,12 @@
+use std::{any::type_name, str::FromStr};
+
 use anyhow::{anyhow, Context};
 use bitflags::bitflags;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use num_enum::{FromPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 use thiserror::Error;
+
+use crate::ty::{UnoComplexType, UnoSimpleTypeClass, UnoType, UnoTypeClass};
 
 bitflags! {
     pub struct HeaderFlags: u8 {
@@ -106,13 +110,7 @@ fn read_block_header(input: &mut BytesMut) -> Option<BlockHeader> {
 }
 
 #[derive(Debug)]
-struct ReplyMessage {
-    // header_flags: ReplyHeaderFlags,
-    // tid: Option<Tid>,
-    // exception: Option<(String, Vec<u8>)>,
-    // return_value: Option<Vec<u8>>,
-    // out_parameters: Vec<u8>,
-}
+struct ReplyMessage {}
 
 pub fn read_message(input: &mut BytesMut) -> Option<Message> {
     // Input too short to be a message
@@ -130,15 +128,7 @@ pub fn read_message(input: &mut BytesMut) -> Option<Message> {
         read_reply_message(input, flags).map(Message::Reply)
     }
 }
-pub struct RequestMessage {
-    // header_flags: HeaderFlags,
-    // extra_flags: Option<HeaderExtraFlags>,
-    // function_id: u16,
-    // interface_type: Option<String>,
-    // oid: Option<String>,
-    // tid: Option<Vec<u8>>,
-    // parameters: Vec<u8>,
-}
+pub struct RequestMessage {}
 
 fn read_request_message(input: &mut BytesMut, flags: HeaderFlags) -> Option<RequestMessage> {
     let mut extra_flags = None;
@@ -205,7 +195,7 @@ fn read_compressed_number(buf: &mut BytesMut) -> Option<u32> {
 
 pub enum UnoValue {
     Void,
-    Boolean(u8),
+    Boolean(bool),
     Byte(i8),
     Short(i16),
     UnsignedShort(u16),
@@ -216,12 +206,133 @@ pub enum UnoValue {
     Float(f32),
     Double(f64),
     Char(char),
-    Any(Box<UnoAny>),
+    String(String),
+    Type(UnoType),
+    Any(Box<UnoValue>),
     Sequence(UnoSequence),
     Enum(UnoEnum),
     Struct(UnoStruct),
     Exception(UnoException),
     Interface(UnoInterface),
+}
+
+fn read_value(
+    buf: &mut BytesMut,
+    cache: &mut UnoCache,
+    ty: UnoType,
+) -> Option<anyhow::Result<UnoValue>> {
+    match ty {
+        UnoType::Simple(ty) => read_value_simple(buf, cache, ty),
+        UnoType::Complex(ty) => read_value_complex(buf, cache, ty),
+    }
+}
+
+fn read_value_simple(
+    buf: &mut BytesMut,
+    cache: &mut UnoCache,
+    ty: UnoSimpleTypeClass,
+) -> Option<anyhow::Result<UnoValue>> {
+    match ty {
+        UnoSimpleTypeClass::Void => Some(Ok(UnoValue::Void)),
+        UnoSimpleTypeClass::Boolean => {
+            let value = read_u8(buf)?;
+            if value > 1 {
+                return Some(Err(anyhow!("invalid boolean value, expected 1 or 0")));
+            }
+
+            Some(Ok(UnoValue::Boolean(value == 1)))
+        }
+        UnoSimpleTypeClass::Byte => {
+            let value = read_u8(buf)?;
+            Some(Ok(UnoValue::Byte(value as i8)))
+        }
+        UnoSimpleTypeClass::Short => {
+            let value = read_u16(buf)?;
+            Some(Ok(UnoValue::Short(value as i16)))
+        }
+        UnoSimpleTypeClass::UnsignedShort => {
+            let value = read_u16(buf)?;
+            Some(Ok(UnoValue::UnsignedShort(value)))
+        }
+        UnoSimpleTypeClass::Long => {
+            let value = read_u32(buf)?;
+            Some(Ok(UnoValue::Long(value as i32)))
+        }
+        UnoSimpleTypeClass::UnsignedLong => {
+            let value = read_u32(buf)?;
+            Some(Ok(UnoValue::UnsignedLong(value)))
+        }
+        UnoSimpleTypeClass::Hyper => {
+            let value = read_u64(buf)?;
+            Some(Ok(UnoValue::Hyper(value as i64)))
+        }
+        UnoSimpleTypeClass::UnsignedHyper => {
+            let value = read_u64(buf)?;
+            Some(Ok(UnoValue::UnsignedHyper(value)))
+        }
+        UnoSimpleTypeClass::Float => {
+            let value = read_f32(buf)?;
+            Some(Ok(UnoValue::Float(value)))
+        }
+        UnoSimpleTypeClass::Double => {
+            let value = read_f64(buf)?;
+            Some(Ok(UnoValue::Double(value)))
+        }
+        UnoSimpleTypeClass::Char => {
+            let value = read_u16(buf)?;
+            let value = match char::from_u32(value as u32) {
+                Some(value) => value,
+                None => return Some(Err(anyhow!("invalid character"))),
+            };
+            Some(Ok(UnoValue::Char(value)))
+        }
+        UnoSimpleTypeClass::String => {
+            let value = match read_string(buf)? {
+                Ok(value) => value,
+                Err(err) => return Some(Err(err)),
+            };
+            Some(Ok(UnoValue::String(value)))
+        }
+        UnoSimpleTypeClass::Type => {
+            let ty = match read_type(buf, cache)? {
+                Ok(value) => value,
+                Err(err) => return Some(Err(err)),
+            };
+            Some(Ok(UnoValue::Type(ty)))
+        }
+        UnoSimpleTypeClass::Any => {
+            let ty = match read_type(buf, cache)? {
+                Ok(value) => value,
+                Err(err) => return Some(Err(err)),
+            };
+
+            read_value(buf, cache, ty)
+        }
+    }
+}
+
+fn read_value_complex(
+    buf: &mut BytesMut,
+    cache: &mut UnoCache,
+    ty: UnoComplexType,
+) -> Option<anyhow::Result<UnoValue>> {
+    match ty {
+        UnoComplexType::Sequence { value_ty } => todo!(),
+        UnoComplexType::Enum => todo!(),
+        UnoComplexType::Struct => todo!(),
+        UnoComplexType::Exception => todo!(),
+        UnoComplexType::Interface => todo!(),
+    }
+}
+
+fn read_value_sequence(
+    buf: &mut BytesMut,
+    cache: &mut UnoCache,
+    ty: UnoType,
+) -> Option<anyhow::Result<UnoValue>> {
+    let length = read_compressed_number(buf)? as usize;
+
+    todo!();
 }
 
 pub struct UnoAny {
@@ -235,8 +346,6 @@ pub struct UnoSequence {
     pub values: Vec<UnoValue>,
 }
 
-pub fn read_sequence() {}
-
 pub struct UnoEnum {
     pub id: OID,
     pub variant: i32,
@@ -247,10 +356,7 @@ pub struct UnoStruct {
     pub values: Vec<UnoValue>,
 }
 
-pub struct UnoException {
-    pub id: OID,
-    pub values: Vec<UnoValue>,
-}
+pub struct UnoException(pub UnoStruct);
 
 pub enum UnoInterfaceReference {
     /// Null reference
@@ -263,70 +369,7 @@ pub struct UnoInterface {
     pub id: OID,
 }
 
-/// Type class of an UNO value
-#[derive(Debug, PartialEq, Eq)]
-pub enum UnoTypeClass {
-    Simple(UnoSimpleTypeClass),
-    Complex(UnoComplexTypeClass),
-}
-
-impl TryFromPrimitive for UnoTypeClass {
-    type Primitive = u8;
-
-    type Error = TryFromPrimitiveError<Self>;
-
-    const NAME: &'static str = stringify!(UnoTypeClass);
-
-    fn try_from_primitive(number: Self::Primitive) -> Result<Self, Self::Error> {
-        if let Ok(value) = UnoSimpleTypeClass::try_from_primitive(number) {
-            return Ok(Self::Simple(value));
-        }
-
-        if let Ok(value) = UnoComplexTypeClass::try_from_primitive(number) {
-            return Ok(Self::Complex(value));
-        }
-
-        Err(TryFromPrimitiveError::new(number))
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, TryFromPrimitive)]
-#[repr(u8)]
-pub enum UnoSimpleTypeClass {
-    Void = 0,
-    Boolean = 2,
-    Byte = 3,
-    Short = 4,
-    UnsignedShort = 5,
-    Long = 6,
-    UnsignedLong = 7,
-    Hyper = 8,
-    UnsignedHyper = 9,
-    Float = 10,
-    Double = 11,
-    Char = 1,
-    String = 12,
-    Type = 13,
-    Any = 14,
-}
-
-#[derive(Debug, PartialEq, Eq, TryFromPrimitive)]
-#[repr(u8)]
-pub enum UnoComplexTypeClass {
-    Sequence = 20,
-    Enum = 15,
-    Struct = 17,
-    Exception = 19,
-    Interface = 22,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum UnoType {
-    Simple(UnoSimpleTypeClass),
-    Complex(UnoComplexTypeClass, Option<String>),
-}
-
-fn read_type(buf: &mut BytesMut) -> Option<anyhow::Result<UnoType>> {
+fn read_type(buf: &mut BytesMut, cache: &mut UnoCache) -> Option<anyhow::Result<UnoType>> {
     if buf.is_empty() {
         return None;
     }
@@ -341,7 +384,7 @@ fn read_type(buf: &mut BytesMut) -> Option<anyhow::Result<UnoType>> {
             Err(err) => return Some(Err(err)),
         };
 
-    let complex_type = match type_class {
+    let complex_class_type = match type_class {
         UnoTypeClass::Complex(value) => value,
         // Simple type requires no extra handling
         UnoTypeClass::Simple(value) => {
@@ -352,18 +395,51 @@ fn read_type(buf: &mut BytesMut) -> Option<anyhow::Result<UnoType>> {
         }
     };
 
-    // The type value is taken from the cache table
-    if cache_flag_bit == 0 {
-        return Some(Ok(UnoType::Complex(complex_type, None)));
-    }
-
-    // Read the type name
-    let type_value = match read_string(buf)? {
+    let cache_index = match read_cache_index(buf)? {
         Ok(value) => value,
         Err(err) => return Some(Err(err)),
     };
 
-    Some(Ok(UnoType::Complex(complex_type, Some(type_value))))
+    let is_cache = !cache_index.is_ignore();
+
+    // The type value is taken from the cache table
+    if cache_flag_bit == 0 {
+        // Value and cache was not provided
+        if !is_cache {
+            return Some(Err(anyhow!("missing cache index for type")));
+        }
+
+        let cache_value = match cache.type_cached_in(cache_index) {
+            Some(value) => value,
+            None => return Some(Err(anyhow!("unknown type cache index"))),
+        };
+
+        return Some(Ok(cache_value));
+    }
+
+    // Read the type name
+    let type_name = match read_string(buf)? {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
+
+    let complex_type = match UnoType::from_str_complex(&type_name) {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
+
+    if !complex_type.type_matches(&complex_class_type) {
+        return Some(Err(anyhow!("complex type mismatch")));
+    }
+
+    let type_value = UnoType::Complex(complex_type);
+
+    // Cache is set, store the type
+    if is_cache {
+        cache.cache_type_in(cache_index, type_value.clone());
+    }
+
+    Some(Ok(type_value))
 }
 
 fn write_type(buf: &mut BytesMut, ty: UnoType) {
@@ -410,6 +486,15 @@ fn read_string(buf: &mut BytesMut) -> Option<anyhow::Result<String>> {
     Some(Ok(value))
 }
 
+/// Reads a unsigned byte from the bytes
+fn read_u8(buf: &mut BytesMut) -> Option<u8> {
+    if buf.is_empty() {
+        return None;
+    }
+
+    Some(buf.get_u8())
+}
+
 /// Reads a unsigned 16bit int from the bytes
 fn read_u16(buf: &mut BytesMut) -> Option<u16> {
     if buf.len() < 2 {
@@ -419,13 +504,40 @@ fn read_u16(buf: &mut BytesMut) -> Option<u16> {
     Some(buf.get_u16())
 }
 
-/// Reads a unsigned 23bit int from the bytes
+/// Reads a unsigned 32bit int from the bytes
 fn read_u32(buf: &mut BytesMut) -> Option<u32> {
     if buf.len() < 4 {
         return None;
     }
 
     Some(buf.get_u32())
+}
+
+/// Reads a unsigned 64bit int from the bytes
+fn read_u64(buf: &mut BytesMut) -> Option<u64> {
+    if buf.len() < 8 {
+        return None;
+    }
+
+    Some(buf.get_u64())
+}
+
+/// Reads a unsigned 32bit float from the bytes
+fn read_f32(buf: &mut BytesMut) -> Option<f32> {
+    if buf.len() < 4 {
+        return None;
+    }
+
+    Some(buf.get_f32())
+}
+
+/// Reads a unsigned 64bit float from the bytes
+fn read_f64(buf: &mut BytesMut) -> Option<f64> {
+    if buf.len() < 8 {
+        return None;
+    }
+
+    Some(buf.get_f64())
 }
 
 fn write_string(buf: &mut BytesMut, value: &str) {
@@ -622,5 +734,17 @@ impl UnoCache {
     /// Sets the [TID] at the provided cache index for the inbound cache
     pub fn cache_tid_in(&mut self, index: CacheIndex, value: TID) {
         self.tid_cache_in[index.0 as usize] = Some(value)
+    }
+
+    /// Gets a [TID] from the inbound cache at the provided index
+    pub fn type_cached_in(&self, index: CacheIndex) -> Option<UnoType> {
+        let value = &self.type_cache_in[index.0 as usize];
+
+        value.clone()
+    }
+
+    /// Sets the [TID] at the provided cache index for the inbound cache
+    pub fn cache_type_in(&mut self, index: CacheIndex, value: UnoType) {
+        self.type_cache_in[index.0 as usize] = Some(value)
     }
 }
