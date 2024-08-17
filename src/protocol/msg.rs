@@ -1,7 +1,8 @@
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use bitflags::bitflags;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use num_enum::{FromPrimitive, TryFromPrimitive, TryFromPrimitiveError};
+use thiserror::Error;
 
 bitflags! {
     pub struct HeaderFlags: u8 {
@@ -103,8 +104,6 @@ fn read_block_header(input: &mut BytesMut) -> Option<BlockHeader> {
         message_count,
     })
 }
-
-pub type Tid = u32;
 
 #[derive(Debug)]
 struct ReplyMessage {
@@ -219,15 +218,10 @@ pub enum UnoValue {
     Char(char),
     Any(Box<UnoAny>),
     Sequence(UnoSequence),
-    Enum(i32),
+    Enum(UnoEnum),
     Struct(UnoStruct),
     Exception(UnoException),
     Interface(UnoInterface),
-}
-
-pub struct UnoSequence {
-    pub ty: UnoTypeClass,
-    pub values: Vec<UnoValue>,
 }
 
 pub struct UnoAny {
@@ -235,11 +229,39 @@ pub struct UnoAny {
     pub value: UnoValue,
 }
 
-pub struct UnoStruct {}
+pub struct UnoSequence {
+    pub id: OID,
+    pub ty: UnoTypeClass,
+    pub values: Vec<UnoValue>,
+}
 
-pub struct UnoException {}
+pub fn read_sequence() {}
 
-pub struct UnoInterface {}
+pub struct UnoEnum {
+    pub id: OID,
+    pub variant: i32,
+}
+
+pub struct UnoStruct {
+    pub id: OID,
+    pub values: Vec<UnoValue>,
+}
+
+pub struct UnoException {
+    pub id: OID,
+    pub values: Vec<UnoValue>,
+}
+
+pub enum UnoInterfaceReference {
+    /// Null reference
+    Null,
+    /// Object the interface references
+    Object(OID),
+}
+
+pub struct UnoInterface {
+    pub id: OID,
+}
 
 /// Type class of an UNO value
 #[derive(Debug, PartialEq, Eq)]
@@ -348,16 +370,36 @@ fn write_type(buf: &mut BytesMut, ty: UnoType) {
     todo!()
 }
 
-fn read_string(buf: &mut BytesMut) -> Option<anyhow::Result<String>> {
+fn read_byte_sequence(buf: &mut BytesMut) -> Option<Vec<u8>> {
     let length = read_compressed_number(buf)? as usize;
 
     if buf.len() < length {
         return None;
     }
 
-    // Create buffer for the text bytes
-    let mut text_bytes = vec![0; length];
-    buf.copy_to_slice(&mut text_bytes);
+    // Create buffer for the bytes
+    let mut bytes = vec![0; length];
+    buf.copy_to_slice(&mut bytes);
+
+    Some(bytes)
+}
+
+fn write_byte_sequence(buf: &mut BytesMut, value: &[u8]) {
+    let length = value.len();
+
+    // Ensure the max length is not reached
+    debug_assert!(length < u32::MAX as usize);
+
+    // Write the length number
+    write_compressed_number(buf, length as u32);
+
+    // Copy the bytes onto the buffer
+    buf.copy_from_slice(value);
+}
+
+fn read_string(buf: &mut BytesMut) -> Option<anyhow::Result<String>> {
+    // Read the text bytes
+    let text_bytes = read_byte_sequence(buf)?;
 
     // Get the string value back
     let value = match String::from_utf8(text_bytes).context("expected utf8 string value") {
@@ -368,15 +410,217 @@ fn read_string(buf: &mut BytesMut) -> Option<anyhow::Result<String>> {
     Some(Ok(value))
 }
 
+/// Reads a unsigned 16bit int from the bytes
+fn read_u16(buf: &mut BytesMut) -> Option<u16> {
+    if buf.len() < 2 {
+        return None;
+    }
+
+    Some(buf.get_u16())
+}
+
+/// Reads a unsigned 23bit int from the bytes
+fn read_u32(buf: &mut BytesMut) -> Option<u32> {
+    if buf.len() < 4 {
+        return None;
+    }
+
+    Some(buf.get_u32())
+}
+
 fn write_string(buf: &mut BytesMut, value: &str) {
-    let length = value.len();
+    write_byte_sequence(buf, value.as_bytes())
+}
 
-    // Ensure the max length is not reached
-    debug_assert!(length < u32::MAX as usize);
+fn read_oid(buf: &mut BytesMut, cache: &mut UnoCache) -> Option<anyhow::Result<OID>> {
+    // Load the OID value
+    let value = match read_string(buf)? {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
 
-    // Write the length number
-    write_compressed_number(buf, length as u32);
+    // Load the cache index
+    let cache_index = match read_cache_index(buf)? {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
 
-    // Copy the string bytes onto the buffer
-    buf.copy_from_slice(value.as_bytes());
+    let is_cache = !cache_index.is_ignore();
+
+    // Empty OID and cache is set, attempt cache load
+    if value.is_empty() && is_cache {
+        let cache_value = match cache.oid_cached_in(cache_index) {
+            Some(value) => value,
+            None => return Some(Err(anyhow!("unknown oid cache index"))),
+        };
+
+        return Some(Ok(cache_value));
+    }
+
+    let value = OID(value);
+
+    // Cache is set, store the OID
+    if is_cache {
+        cache.cache_oid_in(cache_index, value.clone());
+    }
+
+    Some(Ok(value))
+}
+
+fn read_tid(buf: &mut BytesMut, cache: &mut UnoCache) -> Option<anyhow::Result<TID>> {
+    // Read the TID bytes
+    let value = read_byte_sequence(buf)?;
+
+    // Load the cache index
+    let cache_index = match read_cache_index(buf)? {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
+
+    let is_cache = !cache_index.is_ignore();
+
+    if value.is_empty() {
+        // Value and cache was not provided
+        if !is_cache {
+            return Some(Err(anyhow!("missing cache index for empty tid value")));
+        }
+
+        let cache_value = match cache.tid_cached_in(cache_index) {
+            Some(value) => value,
+            None => return Some(Err(anyhow!("unknown tid cache index"))),
+        };
+
+        return Some(Ok(cache_value));
+    }
+
+    let value = TID(value);
+
+    // Cache is set, store the OID
+    if is_cache {
+        cache.cache_tid_in(cache_index, value.clone());
+    }
+
+    Some(Ok(value))
+}
+
+pub struct CacheIndex(u16);
+
+impl CacheIndex {
+    pub fn is_ignore(&self) -> bool {
+        self.0 == CACHE_IGNORE
+    }
+}
+
+fn read_cache_index(buf: &mut BytesMut) -> Option<anyhow::Result<CacheIndex>> {
+    if buf.len() < 2 {
+        return None;
+    }
+
+    let value = buf.get_u16();
+
+    if value as usize >= CACHE_SIZE && value != CACHE_IGNORE {
+        return Some(Err(anyhow!("cache index {value} out of range")));
+    }
+
+    Some(Ok(CacheIndex(value)))
+}
+
+/// Uno Thread Identifier
+#[derive(Debug, Clone)]
+pub struct TID(Vec<u8>);
+
+/// Object Identifier
+///
+/// Globally unique object identifier, always a non-empty ASCII string.
+#[derive(Debug, Clone)]
+pub struct OID(String);
+
+impl OID {
+    pub fn value(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl From<OID> for String {
+    fn from(value: OID) -> Self {
+        value.into_inner()
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("object identifier cannot be empty")]
+pub struct EmptyObjectIdentifier;
+
+impl TryFrom<String> for OID {
+    type Error = EmptyObjectIdentifier;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.is_empty() {
+            return Err(EmptyObjectIdentifier);
+        }
+
+        Ok(OID(value))
+    }
+}
+
+const CACHE_IGNORE: u16 = 0xFFFF;
+const CACHE_SIZE: usize = 256;
+
+pub struct UnoCache {
+    // FIRST LEVEL CACHE:
+    // last out -> OID
+    // last in <- OID
+    last_oid_out: Option<OID>,
+    last_oid_in: Option<OID>,
+
+    last_tid_out: Option<TID>,
+    last_tid_in: Option<TID>,
+
+    last_type_out: Option<UnoType>,
+    last_type_in: Option<UnoType>,
+
+    // initially both empty
+    // header specifies when to use OID cache
+    // SECOND LEVEL CACHE:
+    // cache table, cache table stores 256 entries. indexed using u16
+    // stores OID at given index, will override old indexes, if index = 0xFFFF the OID is nto entered
+    // cache index must be in range of 0 - 255
+    oid_cache_out: [Option<OID>; 256],
+    oid_cache_in: [Option<OID>; 256],
+
+    tid_cache_out: [Option<TID>; 256],
+    tid_cache_in: [Option<TID>; 256],
+
+    type_cache_out: [Option<UnoType>; 256],
+    type_cache_in: [Option<UnoType>; 256],
+}
+
+impl UnoCache {
+    /// Gets a [OID] from the inbound cache at the provided index
+    pub fn oid_cached_in(&self, index: CacheIndex) -> Option<OID> {
+        let value = &self.oid_cache_in[index.0 as usize];
+
+        value.clone()
+    }
+
+    /// Sets the [OID] at the provided cache index for the inbound cache
+    pub fn cache_oid_in(&mut self, index: CacheIndex, value: OID) {
+        self.oid_cache_in[index.0 as usize] = Some(value)
+    }
+
+    /// Gets a [TID] from the inbound cache at the provided index
+    pub fn tid_cached_in(&self, index: CacheIndex) -> Option<TID> {
+        let value = &self.tid_cache_in[index.0 as usize];
+
+        value.clone()
+    }
+
+    /// Sets the [TID] at the provided cache index for the inbound cache
+    pub fn cache_tid_in(&mut self, index: CacheIndex, value: TID) {
+        self.tid_cache_in[index.0 as usize] = Some(value)
+    }
 }

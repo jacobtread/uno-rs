@@ -8,4 +8,5 @@ anyhow = "1.0.86"
 bitflags = { version = "2.6.0", features = ["std"] }
 bytes = "1.7.1"
 num_enum = "0.7.3"
+thiserror = "1.0.63"
 tokio = { version = "1.39.2", features = ["full"] }
