@@ -75,39 +75,6 @@ bitflags! {
     }
 }
 
-/// Represents a block of one or more messages
-#[derive(Debug)]
-struct Block {
-    /// The header for the block
-    header: BlockHeader,
-    /// The parsed messages from the block
-    messages: Vec<()>,
-}
-
-/// Header describing a block of messages
-#[derive(Debug)]
-struct BlockHeader {
-    /// The size in bytes of the following block content
-    size: u32,
-    /// The number of messages included in the block
-    message_count: u32,
-}
-
-/// Reads a block header from the provided bytes
-fn read_block_header(input: &mut BytesMut) -> Option<BlockHeader> {
-    // Not enough bytes to read header
-    if input.len() < 8 {
-        return None;
-    }
-
-    let size = input.get_u32();
-    let message_count = input.get_u32();
-
-    Some(BlockHeader {
-        size,
-        message_count,
-    })
-}
 
 #[derive(Debug)]
 struct ReplyMessage {}
