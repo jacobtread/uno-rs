@@ -208,7 +208,7 @@ pub enum UnoValue {
     Enum(UnoEnum),
     Struct(UnoStruct),
     Exception(UnoException),
-    Interface(UnoInterface),
+    Interface(Option<UnoInterfaceRef>),
 }
 
 pub struct UnoAny {
@@ -240,6 +240,6 @@ pub enum UnoInterfaceReference {
     Object(OID),
 }
 
-pub struct UnoInterface {
+pub struct UnoInterfaceRef {
     pub id: OID,
 }

@@ -1,12 +1,15 @@
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use bytes::{Buf, BytesMut};
 use num_enum::TryFromPrimitive;
 
-use crate::ty::{UnoComplexType, UnoSimpleTypeClass, UnoType, UnoTypeClass};
+use crate::{
+    ty::{UnoComplexType, UnoSimpleTypeClass, UnoType, UnoTypeClass},
+    urp::types::UnoInterfaceRef,
+};
 
 use super::types::{
-    BlockHeader, CacheIndex, HeaderExtraFlags, HeaderFlags, Message, RawBlock, ReplyMessage,
-    RequestMessage, UnoAny, UnoSequence, UnoValue, CACHE_SIZE, OID, TID,
+    BlockHeader, CACHE_SIZE, CacheIndex, HeaderExtraFlags, HeaderFlags, Message, OID, RawBlock,
+    ReplyMessage, RequestMessage, TID, UnoAny, UnoSequence, UnoValue,
 };
 
 /// State for the reader
@@ -219,7 +222,10 @@ pub fn read_string(buf: &mut BytesMut) -> Option<anyhow::Result<String>> {
     Some(Ok(value))
 }
 
-pub fn read_oid(buf: &mut BytesMut, state: &mut ReaderState) -> Option<anyhow::Result<OID>> {
+pub fn read_oid(
+    buf: &mut BytesMut,
+    state: &mut ReaderState,
+) -> Option<anyhow::Result<Option<OID>>> {
     // Load the OID value
     let value = match read_string(buf)? {
         Ok(value) => value,
@@ -248,16 +254,14 @@ pub fn read_oid(buf: &mut BytesMut, state: &mut ReaderState) -> Option<anyhow::R
             }
         }
         CacheIndex::Ignore => {
-            // Empty cache with empty ID is an error
+            // Empty cache with empty ID (Occurs for things like null references for interfaces)
             if value.is_empty() {
-                return Some(Err(anyhow!(
-                    "OID was empty and no cache index was specified"
-                )));
+                return Some(Ok(None));
             }
         }
     };
 
-    Some(Ok(value))
+    Some(Ok(Some(value)))
 }
 
 pub fn read_tid(buf: &mut BytesMut, state: &mut ReaderState) -> Option<anyhow::Result<TID>> {
@@ -489,7 +493,15 @@ pub fn read_value_complex(
         UnoComplexType::Enum => todo!(),
         UnoComplexType::Struct => todo!(),
         UnoComplexType::Exception => todo!(),
-        UnoComplexType::Interface => todo!(),
+        UnoComplexType::Interface => {
+            let oid = match read_oid(buf, cache)? {
+                Ok(value) => value,
+                Err(err) => return Some(Err(err)),
+            };
+
+            let interface = oid.map(|oid| UnoInterfaceRef { id: oid });
+            Some(Ok(UnoValue::Interface(interface)))
+        }
     }
 }
 
@@ -566,7 +578,7 @@ fn read_reply_message(input: &mut BytesMut, flags: HeaderFlags) -> Option<ReplyM
 mod test {
     use bytes::BytesMut;
 
-    use super::{read_block, ReaderState};
+    use super::{ReaderState, read_block};
 
     #[test]
     fn test_sample_initial() {
